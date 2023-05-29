@@ -15,80 +15,139 @@
     }                                                                    \
   } while (0)
 
+#define BLOCK_SIZE 32
+
 static __global__ void matmul_kernel(float *A, float *B, float *C, int M, int N, int K)
-{
-  int i = blockDim.x * blockIdx.x + threadIdx.x;
-  int j = blockDim.y * blockIdx.y + threadIdx.y;
-  if (i >= M || j >= N) return;
-  float sum = 0.0;
-  for (int k = 0; k < K; k++)
+{  
+  int j = blockDim.x * blockIdx.x + threadIdx.x;
+  int i = blockDim.y * blockIdx.y + threadIdx.y;
+  
+  int gj = blockIdx.x;
+  int gi = blockIdx.y;
+
+  if(gi * BLOCK_SIZE >= M || gj * BLOCK_SIZE >= N) return;
+
+  int lj = threadIdx.x;
+  int li = threadIdx.y;
+
+  __shared__ float Alocal[BLOCK_SIZE][BLOCK_SIZE];
+  __shared__ float Blocal[BLOCK_SIZE][BLOCK_SIZE];
+
+  float c = 0.f;
+
+  int A_row_index = (gi * BLOCK_SIZE + li);
+  int B_col_index = (gj * BLOCK_SIZE + lj);
+
+  for (int bk = 0; bk < K; bk += BLOCK_SIZE)
   {
-    sum += A[i * K + k] * B[k * N + j];
+    int A_col_index = bk + lj;
+    Alocal[li][lj] = (A_row_index < M && A_col_index < K ) ? A[A_row_index * K + A_col_index] : 0.f;
+
+    int B_row_index = bk + li;
+    Blocal[li][lj] = (B_row_index < K && B_col_index < N) ? B[B_row_index * N + B_col_index] : 0.f;
+
+    __syncthreads();
+
+    for (int lk = 0; lk < BLOCK_SIZE; ++lk)
+    {
+      c += Alocal[li][lk] * Blocal[lk][lj];
+    }
+    __syncthreads();
   }
-  C[i * N + j] = sum;
+  
+  if (i < M && j < N)
+  {
+    C[i * N + j] = c;
+  }
+
 }
 
-#define BLOCKS 4
+#define NGPU 4
+#define EVENTS_PER_GPU 1 //INCREASE as needed
 
-static size_t Mbegin[BLOCKS], Mend[BLOCKS];
-static cudaStream_t data_stream, calc_stream;
-static cudaEvent_t events[BLOCKS];
-static float *A_gpu, *B_gpu, *C_gpu;
+static size_t Mbegin[NGPU], Mend[NGPU];
+static size_t ngpu;
+static cudaStream_t streams[NGPU];
+static cudaEvent_t events[NGPU][EVENTS_PER_GPU];
+static float *A_gpu[NGPU], *B_gpu[NGPU], *C_gpu[NGPU];
 
 void matmul_initialize(int M, int N, int K) 
 {
-  for (size_t i = 0; i < BLOCKS; i++)
+  ngpu = 4;
+
+  for (size_t i = 0; i < ngpu; i++)
   {
-    Mbegin[i] = M / BLOCKS * i;
-    Mend[i] = M / BLOCKS * (i + 1);
-    if (i == BLOCKS - 1) Mend[i] = M;
+    Mbegin[i] = M / ngpu * i;
+    Mend[i] = M / ngpu * (i + 1);
+    if (i == ngpu - 1) Mend[i] = M;
   }
 
-  CHECK_CUDA(cudaStreamCreate(&data_stream));
-  CHECK_CUDA(cudaStreamCreate(&calc_stream));
-  for (int i = 0; i < BLOCKS; i++)
+  for (size_t i = 0; i < ngpu; i++)
   {
-    CHECK_CUDA(cudaEventCreate(&events[i]));
+    CHECK_CUDA(cudaSetDevice(i));
+    CHECK_CUDA(cudaStreamCreate(&streams[i]));
+    for (int j=0; j < EVENTS_PER_GPU; j++)
+    {
+      CHECK_CUDA(cudaEventCreate(&events[i][j]));
+    }
   }
-  CHECK_CUDA(cudaMalloc(&A_gpu, M * K * sizeof(float)));
-  CHECK_CUDA(cudaMalloc(&B_gpu, K * N * sizeof(float)));
-  CHECK_CUDA(cudaMalloc(&C_gpu, M * N * sizeof(float)));
+
+  for (size_t i =0; i < ngpu; i++)
+  {
+    CHECK_CUDA(cudaSetDevice(i));
+    CHECK_CUDA(cudaMalloc(&A_gpu[i], (Mend[i] - Mbegin[i]) * K * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&B_gpu[i], K * N * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&C_gpu[i], (Mend[i] - Mbegin[i]) * N * sizeof(float)));
+  }
+
 }
 
 
 void matmul(const float *A, const float *B, float *C, int M, int N, int K) 
 {
-  CHECK_CUDA(cudaMemcpyAsync(B_gpu, B, K * N * sizeof(float), cudaMemcpyHostToDevice, data_stream));
-  for(int i = 0; i < BLOCKS; i++)
+  for (size_t i =0; i < ngpu; i++)
   {
-    CHECK_CUDA(cudaMemcpyAsync(&A_gpu[Mbegin[i] * K], &A[Mbegin[i] * K], (Mend[i] - Mbegin[i]) * K * sizeof(float), cudaMemcpyHostToDevice, data_stream));
-    CHECK_CUDA(cudaEventRecord(events[i], data_stream));
+    CHECK_CUDA(cudaSetDevice(i));
+    CHECK_CUDA(cudaMemcpyAsync(A_gpu[i], &A[Mbegin[i] * K], (Mend[i] - Mbegin[i]) * K * sizeof(float), cudaMemcpyHostToDevice, streams[i]));
+    CHECK_CUDA(cudaMemcpyAsync(B_gpu[i], B, K * N * sizeof(float), cudaMemcpyHostToDevice, streams[i]));
   }
 
-  for (int i =0; i < BLOCKS; i++)
+  for (size_t i =0; i < ngpu; i++)
   {
+    CHECK_CUDA(cudaSetDevice(i));
     dim3 blockDim(32, 32);
-    dim3 gridDim((Mend[i] - Mbegin[i] + 32 - 1) / 32, (N + 32 - 1) / 32);
-    CHECK_CUDA(cudaStreamWaitEvent(calc_stream, events[i]));
-    matmul_kernel<<<gridDim, blockDim, 0, calc_stream>>>(&A_gpu[Mbegin[i] * K], B_gpu, &C_gpu[Mbegin[i] * N], (Mend[i] - Mbegin[i]), N, K);
+    dim3 gridDim((N + 32 - 1) / 32, (Mend[i] - Mbegin[i] + 32 - 1) / 32);
+    matmul_kernel<<<gridDim, blockDim>>>(A_gpu[i], B_gpu[i], C_gpu[i], Mend[i] - Mbegin[i], N, K);
+    CHECK_CUDA(cudaGetLastError());
   }
 
-  CHECK_CUDA(cudaStreamSynchronize(calc_stream));
-  CHECK_CUDA(cudaMemcpyAsync(C, C_gpu, M * N * sizeof(float), cudaMemcpyDeviceToHost, data_stream));
-  CHECK_CUDA(cudaStreamSynchronize(data_stream));
+  for(size_t i =0; i < ngpu; i++)
+  {
+    CHECK_CUDA(cudaSetDevice(i));
+    CHECK_CUDA(cudaMemcpyAsync(&C[Mbegin[i] * N], C_gpu[i], (Mend[i] - Mbegin[i]) * N * sizeof(float), cudaMemcpyDeviceToHost, streams[i]));
+  }
+
+  for (size_t i =0; i < ngpu; i++)
+  {
+    CHECK_CUDA(cudaSetDevice(i));
+    CHECK_CUDA(cudaStreamSynchronize(streams[i]));
+  }
 
 }
 
 
 void matmul_finalize() 
 {
-  CHECK_CUDA(cudaFree(A_gpu));
-  CHECK_CUDA(cudaFree(B_gpu));
-  CHECK_CUDA(cudaFree(C_gpu));
-  CHECK_CUDA(cudaStreamDestroy(data_stream));
-  CHECK_CUDA(cudaStreamDestroy(calc_stream));
-  for (int i =0; i < BLOCKS; i++)
+  for(size_t i = 0; i < ngpu; i++)
   {
-    CHECK_CUDA(cudaEventDestroy(events[i]));
+    CHECK_CUDA(cudaSetDevice(i));
+    CHECK_CUDA(cudaFree(A_gpu[i]));
+    CHECK_CUDA(cudaFree(B_gpu[i]));
+    CHECK_CUDA(cudaFree(C_gpu[i]));
+    CHECK_CUDA(cudaStreamDestroy(streams[i]));
+    for (int j = 0; j < EVENTS_PER_GPU; j++)
+    {
+      CHECK_CUDA(cudaEventDestroy(events[i][j]));
+    }
   }
 }
