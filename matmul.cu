@@ -15,51 +15,54 @@
     }                                                                    \
   } while (0)
 
-#define BLOCK_SIZE 32
+#define TS 64
+#define WPT 8
+#define RTS TS / WPT
+
 
 static __global__ void matmul_kernel(float *A, float *B, float *C, int M, int N, int K)
 {  
-  int j = blockDim.x * blockIdx.x + threadIdx.x;
-  int i = blockDim.y * blockIdx.y + threadIdx.y;
-  
-  int gj = blockIdx.x;
-  int gi = blockIdx.y;
+  int globalRow = blockDim.y * blockIdx.y + threadIdx.y;
+  int globalCol = WPT * blockDim.x * blockIdx.x + threadIdx.x;
+  int row = threadIdx.y;
+  int col = threadIdx.x;
 
-  if(gi * BLOCK_SIZE >= M || gj * BLOCK_SIZE >= N) return;
+  __shared__ float Asub[TS][TS];
+  __shared__ float Bsub[TS][TS];
 
-  int lj = threadIdx.x;
-  int li = threadIdx.y;
-
-  __shared__ float Alocal[BLOCK_SIZE][BLOCK_SIZE];
-  __shared__ float Blocal[BLOCK_SIZE][BLOCK_SIZE];
-
-  float c = 0.f;
-
-  int A_row_index = (gi * BLOCK_SIZE + li);
-  int B_col_index = (gj * BLOCK_SIZE + lj);
-
-  for (int bk = 0; bk < K; bk += BLOCK_SIZE)
+  float acc[WPT];
+  for (int i =0; i < WPT; i++)
   {
-    int A_col_index = bk + lj;
-    Alocal[li][lj] = (A_row_index < M && A_col_index < K ) ? A[A_row_index * K + A_col_index] : 0.f;
+    acc[i] = 0.0;
+  }
 
-    int B_row_index = bk + li;
-    Blocal[li][lj] = (B_row_index < K && B_col_index < N) ? B[B_row_index * N + B_col_index] : 0.f;
+  for (int offset =0; offset < K; offset += TS)
+  {
+    int tiledRow = offset + row;
+    int tiledCol = offset + col;
+
+    for (int i=0; i < WPT; i++)
+    {
+      Asub[row][col + i * RTS] = A[globalRow * K + (tiledCol + i * RTS)];
+      Bsub[row][col + i * RTS] = B[tiledRow * N + (globalCol + i * RTS)];
+    }
 
     __syncthreads();
 
-    for (int lk = 0; lk < BLOCK_SIZE; ++lk)
+    for (int k=0; k < TS; ++k)
     {
-      c += Alocal[li][lk] * Blocal[lk][lj];
+      for (int i =0; i < WPT; i++)
+      {
+        acc[i] += Asub[row][k] * Bsub[k][col + i * RTS];
+      }
     }
     __syncthreads();
   }
-  
-  if (i < M && j < N)
+  for (int i =0; i < WPT; i++)
   {
-    C[i * N + j] = c;
+    C[globalRow * N + (globalCol + i * RTS)] = acc[i];
   }
-
+  
 }
 
 #define NGPU 4
@@ -115,8 +118,8 @@ void matmul(const float *A, const float *B, float *C, int M, int N, int K)
   for (size_t i =0; i < ngpu; i++)
   {
     CHECK_CUDA(cudaSetDevice(i));
-    dim3 blockDim(32, 32);
-    dim3 gridDim((N + 32 - 1) / 32, (Mend[i] - Mbegin[i] + 32 - 1) / 32);
+    dim3 blockDim(TS / WPT, TS);
+    dim3 gridDim((N + TS - 1) / TS, (Mend[i] - Mbegin[i] + TS - 1) / TS);
     matmul_kernel<<<gridDim, blockDim>>>(A_gpu[i], B_gpu[i], C_gpu[i], Mend[i] - Mbegin[i], N, K);
     CHECK_CUDA(cudaGetLastError());
   }
@@ -132,7 +135,6 @@ void matmul(const float *A, const float *B, float *C, int M, int N, int K)
     CHECK_CUDA(cudaSetDevice(i));
     CHECK_CUDA(cudaStreamSynchronize(streams[i]));
   }
-
 }
 
 
