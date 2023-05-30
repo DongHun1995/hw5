@@ -16,7 +16,7 @@
   } while (0)
 
 #define TS 64
-#define WPT 8
+#define WPT 4
 #define RTS TS / WPT
 
 
