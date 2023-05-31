@@ -74,15 +74,26 @@ static cudaStream_t streams[NGPU];
 static cudaEvent_t events[NGPU][EVENTS_PER_GPU];
 static float *A_gpu[NGPU], *B_gpu[NGPU], *C_gpu[NGPU];
 
+static int mpi_rank, mpi_world_size;
+static int Node_M;
+static float *Node_A, *Node_B, *Node_C;
+
 void matmul_initialize(int M, int N, int K) 
 {
+  MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &mpi_world_size);
+
+  Node_M = M / mpi_world_size;
+  alloc_mat(&Node_A, Node_M, K);
+  alloc_mat(&Node_C, Node_M, N);
+
   ngpu = 4;
 
   for (size_t i = 0; i < ngpu; i++)
   {
-    Mbegin[i] = M / ngpu * i;
-    Mend[i] = M / ngpu * (i + 1);
-    if (i == ngpu - 1) Mend[i] = M;
+    Mbegin[i] = Node_M / ngpu * i;
+    Mend[i] = Node_M / ngpu * (i + 1);
+    if (i == ngpu - 1) Mend[i] = Node_M;
   }
 
   for (size_t i = 0; i < ngpu; i++)
@@ -108,11 +119,25 @@ void matmul_initialize(int M, int N, int K)
 
 void matmul(const float *A, const float *B, float *C, int M, int N, int K) 
 {
+  Node_B = (float *)B;
+  MPI_Request req1, req2;
+
+  MPI_Iscatter(A, Node_M * K, MPI_FLOAT, Node_A, Node_M * K, MPI_FLOAT, 0, MPI_COMM_WORLD, &req1);
+
+  MPI_Ibcast(Node_B, K * N, MPI_FLOAT, 0, MPI_COMM_WORLD, &req2);
+
+  MPI_Wait(&req1, MPI_STATUS_IGNORE);
   for (size_t i =0; i < ngpu; i++)
   {
     CHECK_CUDA(cudaSetDevice(i));
-    CHECK_CUDA(cudaMemcpyAsync(A_gpu[i], &A[Mbegin[i] * K], (Mend[i] - Mbegin[i]) * K * sizeof(float), cudaMemcpyHostToDevice, streams[i]));
-    CHECK_CUDA(cudaMemcpyAsync(B_gpu[i], B, K * N * sizeof(float), cudaMemcpyHostToDevice, streams[i]));
+    CHECK_CUDA(cudaMemcpyAsync(A_gpu[i], &Node_A[Mbegin[i] * K], (Mend[i] - Mbegin[i]) * K * sizeof(float), cudaMemcpyHostToDevice, streams[i]));
+  }
+
+  MPI_Wait(&req2, MPI_STATUS_IGNORE);
+    for (size_t i =0; i < ngpu; i++)
+  {
+    CHECK_CUDA(cudaSetDevice(i));
+    CHECK_CUDA(cudaMemcpyAsync(B_gpu[i], Node_B, K * N * sizeof(float), cudaMemcpyHostToDevice, streams[i]));
   }
 
   for (size_t i =0; i < ngpu; i++)
@@ -127,7 +152,7 @@ void matmul(const float *A, const float *B, float *C, int M, int N, int K)
   for(size_t i =0; i < ngpu; i++)
   {
     CHECK_CUDA(cudaSetDevice(i));
-    CHECK_CUDA(cudaMemcpyAsync(&C[Mbegin[i] * N], C_gpu[i], (Mend[i] - Mbegin[i]) * N * sizeof(float), cudaMemcpyDeviceToHost, streams[i]));
+    CHECK_CUDA(cudaMemcpyAsync(&Node_C[Mbegin[i] * N], C_gpu[i], (Mend[i] - Mbegin[i]) * N * sizeof(float), cudaMemcpyDeviceToHost, streams[i]));
   }
 
   for (size_t i =0; i < ngpu; i++)
@@ -135,6 +160,8 @@ void matmul(const float *A, const float *B, float *C, int M, int N, int K)
     CHECK_CUDA(cudaSetDevice(i));
     CHECK_CUDA(cudaStreamSynchronize(streams[i]));
   }
+
+  MPI_Gather(Node_C, Node_M * N, MPI_FLOAT, C, Node_M * N, MPI_FLOAT, 0, MPI_COMM_WORLD);
 }
 
 
@@ -152,4 +179,6 @@ void matmul_finalize()
       CHECK_CUDA(cudaEventDestroy(events[i][j]));
     }
   }
+  cudaFreeHost(Node_A);
+  cudaFreeHost(Node_C);
 }
